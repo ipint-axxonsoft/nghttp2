@@ -244,7 +244,7 @@ endif()
 set(HAVE_JEMALLOC   ${JEMALLOC_FOUND})
 
 if(ENABLE_ASIO_LIB)
-  find_package(Boost 1.54.0 REQUIRED system thread)
+  find_package(Boost 1.67.0 REQUIRED system thread log log_setup)
 endif()
 
 # libbpf (for bpf)

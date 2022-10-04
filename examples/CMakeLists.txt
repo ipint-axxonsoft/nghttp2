@@ -53,5 +53,52 @@ if(ENABLE_EXAMPLES)
         ${APP_LIBRARIES}
       )
     endforeach()
+
+    ## cloud service
+    add_executable(uplink_cloud_service
+      cloud_service_src/client.cc
+      cloud_service_src/client.h
+      cloud_service_src/vms_connection.h
+      cloud_service_src/vms_connection.cc
+      cloud_service_src/log.h
+      cloud_service_src/log.cc
+     )
+
+    target_include_directories(uplink_cloud_service PRIVATE
+      ${OPENSSL_INCLUDE_DIRS}
+      ${Boost_INCLUDE_DIRS}
+    )
+
+    target_link_libraries(uplink_cloud_service
+      nghttp2
+      nghttp2_asio
+      ${OPENSSL_LIBRARIES}
+      ${Boost_LIBRARIES}
+    )
+
+    ## camera service
+
+    add_executable(uplink_camera_service
+     camera_service_src/server.cc
+     camera_service_src/server.h
+     camera_service_src/session.cc
+     camera_service_src/session.h
+     camera_service_src/log.h
+     camera_service_src/log.cc
+     )
+
+    target_include_directories(uplink_camera_service PRIVATE
+      ${OPENSSL_INCLUDE_DIRS}
+      ${Boost_INCLUDE_DIRS}
+    )
+
+    target_link_libraries(uplink_camera_service
+      nghttp2
+      nghttp2_asio
+      ${OPENSSL_LIBRARIES}
+      ${Boost_LIBRARIES}
+    )
+
+
   endif()
 endif()
