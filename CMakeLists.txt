@@ -333,6 +333,8 @@ endif()
 # XXX is AC_SYS_LARGEFILE still needed for modern systems?
 # add_definitions(-D_FILE_OFFSET_BITS=64)
 
+add_definitions(-DBOOST_LOG_DYN_LINK)
+
 include(CheckStructHasMember)
 check_struct_has_member("struct tm" tm_gmtoff time.h HAVE_STRUCT_TM_TM_GMTOFF)
 
