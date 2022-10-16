@@ -62,6 +62,7 @@ if(ENABLE_EXAMPLES)
       cloud_service_src/vms_connection.cc
       cloud_service_src/log.h
       cloud_service_src/log.cc
+      cloud_service_src/main.cpp
      )
 
     target_include_directories(uplink_cloud_service PRIVATE

@@ -13,28 +13,78 @@
 #include <utility>
 #include <functional>
 
-Client::Client(boost::asio::io_context& io_context, short http2_port, short requests_listening_port, short rtsp_listening_port)
+using boost::asio::ip::tcp;
+
+Client::Client(boost::asio::io_context& io_context,
+	PlainConnection conn,
+	unsigned short requests_listening_port,
+	unsigned short rtsp_listening_port)
 	: io_context_(io_context)
-	, acceptor_(io_context_, tcp::endpoint(tcp::v4(), http2_port))
+	, plain_connections_acceptor_(new tcp::acceptor(io_context_, tcp::endpoint(tcp::v4(), conn.port)))
 	, requests_listening_port_acceptor_(io_context, tcp::endpoint(tcp::v4(), requests_listening_port))
 	, rtsp_listening_port_acceptor_(io_context, tcp::endpoint(tcp::v4(), rtsp_listening_port))
 {
-	BOOST_LOG_TRIVIAL(info) << "ports: http2=" << http2_port
-		<< "; http_port=" << requests_listening_port
-		<< "; rtsp_port=" << rtsp_listening_port;
-
+	BOOST_LOG_TRIVIAL(info) << "ports: plain http2=" << conn.port
+		<< "; http=" << requests_listening_port
+		<< "; rtsp=" << rtsp_listening_port;
+	
 	do_accept();
 }
 
+Client::Client(boost::asio::io_context& io_context,
+	SecuredConnection conn,
+	unsigned short requests_listening_port,
+	unsigned short rtsp_listening_port)
+	: io_context_(io_context)
+	, secure_connections_acceptor_(new tcp::acceptor(io_context_, tcp::endpoint(tcp::v4(), conn.port)))
+	, requests_listening_port_acceptor_(io_context, tcp::endpoint(tcp::v4(), requests_listening_port))
+	, rtsp_listening_port_acceptor_(io_context, tcp::endpoint(tcp::v4(), rtsp_listening_port))
+	, ssl_context_(new boost::asio::ssl::context(boost::asio::ssl::context::sslv23))
+{
+	BOOST_LOG_TRIVIAL(info) << "ports: secured http2=" << conn.port
+		<< "; http=" << requests_listening_port
+		<< "; rtsp=" << rtsp_listening_port;
+}
 
 void Client::do_accept()
 {
-	acceptor_.async_accept(
-		[this](boost::system::error_code ec, tcp::socket socket)
-		{
-			if(!ec)
+	if (secure_connections_acceptor_)
+	{
+		secure_connections_acceptor_->async_accept(
+			[this](boost::system::error_code ec, tcp::socket socket)
 			{
-				BOOST_LOG_TRIVIAL(debug) << "HTTP/2 TCP connection accepted from " << socket.remote_endpoint().address().to_string()
+				if(ec)
+				{
+					BOOST_LOG_TRIVIAL(error) << "HTTP/2 accepted failed";
+					return;
+				}
+
+				BOOST_LOG_TRIVIAL(debug) << "Secured HTTP/2 TLS connection accepted from "
+					<< socket.remote_endpoint().address().to_string()
+					<< ":" << socket.remote_endpoint().port();
+				ssl_socket_.reset(new boost::asio::ssl::stream<tcp::socket>(
+					std::move(socket), *ssl_context_));
+
+				init_nghttp2();
+				open_http2_connection();
+
+				do_read();
+
+				do_requests_port_accept();
+				do_rtsp_connections_accept();
+			}
+		);
+	}
+	else
+	{
+		plain_connections_acceptor_->async_accept(
+			[this](boost::system::error_code ec, tcp::socket socket)
+			{
+				if(ec)
+					return;
+
+				BOOST_LOG_TRIVIAL(debug) << "HTTP/2 TCP connection accepted from "
+					<< socket.remote_endpoint().address().to_string()
 					<< ":" << socket.remote_endpoint().port();
 				socket_.reset(new boost::asio::ip::tcp::socket(std::move(socket)));
 
@@ -46,8 +96,8 @@ void Client::do_accept()
 				do_requests_port_accept();
 				do_rtsp_connections_accept();
 			}
-		}
-	);
+		);
+	}
 }
 
 void Client::do_requests_port_accept()
@@ -134,31 +184,31 @@ void Client::do_rtsp_connections_accept()
 	BOOST_LOG_TRIVIAL(debug) << "Start listening for RTSP connections";
 	rtsp_listening_port_acceptor_.async_accept(
 		[this](boost::system::error_code ec, tcp::socket socket)
-	{
-		if(!ec)
 		{
-			BOOST_LOG_TRIVIAL(debug) << "A new RTSP connection accepted from " << socket.remote_endpoint().address().to_string()
-				<< ":" << socket.remote_endpoint().port();
-
-			auto rtsp_stream_id{0};
-
-			try
+			if(!ec)
 			{
-				rtsp_stream_id = init_ws_stream();
-			}
-			catch(std::runtime_error ec)
-			{
-				BOOST_LOG_TRIVIAL(error) << ec.what();
-				return;
+				BOOST_LOG_TRIVIAL(debug) << "A new RTSP connection accepted from " << socket.remote_endpoint().address().to_string()
+					<< ":" << socket.remote_endpoint().port();
+
+				auto rtsp_stream_id{0};
+
+				try
+				{
+					rtsp_stream_id = init_ws_stream();
+				}
+				catch(std::runtime_error ec)
+				{
+					BOOST_LOG_TRIVIAL(error) << ec.what();
+					return;
+				}
+
+				auto rc = std::make_shared<RtspConnection>(std::move(socket), rtsp_stream_id, this);
+				rc->Start();
+				rtspConns.push_back(rc);
 			}
 
-			auto rc = std::make_shared<RtspConnection>(std::move(socket), rtsp_stream_id, this);
-			rc->Start();
-			rtspConns.push_back(rc);
+			do_rtsp_connections_accept();
 		}
-
-		do_rtsp_connections_accept();
-	}
 	);
 }
 
@@ -178,27 +228,55 @@ int Client::session_send()
 
 void Client::do_read()
 {
+	if (ssl_socket_)
+	{
+		ssl_socket_->async_read_some(boost::asio::buffer(data_, MAX_LENGTH),
+			[this](boost::system::error_code ec, std::size_t length)
+			{
+				if(ec)
+				{
+					BOOST_LOG_TRIVIAL(error) << "Reading finished with an error";
+					return;
+				}
+
+				BOOST_LOG_TRIVIAL(trace) << "Received data in bytes: " << length;
+				ssize_t readlen = nghttp2_session_mem_recv(http2_session_, (const uint8_t*)data_, length);
+
+				if(readlen < 0)
+				{
+					BOOST_LOG_TRIVIAL(error) << "Error: " << nghttp2_strerror((int)readlen);
+					//delete_http2_session_data(session_data);
+					return;
+				}
+
+				do_read();
+			}
+		);
+
+		return;
+	}
+
 	socket_->async_read_some(boost::asio::buffer(data_, MAX_LENGTH),
 		[this](boost::system::error_code ec, std::size_t length)
-	{
-		if(ec)
 		{
-			BOOST_LOG_TRIVIAL(error) << "Reading finished with an error";
-			return;
+			if(ec)
+			{
+				BOOST_LOG_TRIVIAL(error) << "Reading finished with an error";
+				return;
+			}
+
+			BOOST_LOG_TRIVIAL(trace) << "Received data in bytes: " << length;
+			ssize_t readlen = nghttp2_session_mem_recv(http2_session_, (const uint8_t*)data_, length);
+
+			if(readlen < 0)
+			{
+				BOOST_LOG_TRIVIAL(error) << "Error: " << nghttp2_strerror((int)readlen);
+				//delete_http2_session_data(session_data);
+				return;
+			}
+
+			do_read();
 		}
-
-		BOOST_LOG_TRIVIAL(trace) << "Received data in bytes: " << length;
-		ssize_t readlen = nghttp2_session_mem_recv(http2_session_, (const uint8_t*)data_, length);
-
-		if(readlen < 0)
-		{
-			BOOST_LOG_TRIVIAL(error) << "Error: " << nghttp2_strerror((int)readlen);
-			//delete_http2_session_data(session_data);
-			return;
-		}
-
-		do_read();
-	}
 	);
 }
 
@@ -349,19 +427,37 @@ void Client::remove_vms_connection(int32_t http2_session_id)
 	);
 }
 
-ssize_t send_callback(nghttp2_session* session, const uint8_t* data,	size_t length, int flags, void* user_data)
+ssize_t send_callback(nghttp2_session* session, const uint8_t* data,
+	size_t length, int flags, void* user_data)
 {
 	BOOST_LOG_TRIVIAL(trace) << "nghttp2 wanna write something with len: " << length;
 
 	auto* client_instance = (Client*) user_data;
-	boost::asio::async_write(*client_instance->socket_, boost::asio::buffer(data, length),
-		[client_instance](boost::system::error_code ec, std::size_t length)
+	if (client_instance->ssl_socket_)
 	{
-		BOOST_LOG_TRIVIAL(trace) << "Send through send_callback: " << length;
+		boost::asio::async_write(*client_instance->ssl_socket_,
+			boost::asio::buffer(data, length),
+			[client_instance](boost::system::error_code ec, std::size_t length)
+			{
+				BOOST_LOG_TRIVIAL(trace) << "Send through send_callback: " << length;
 
-		if(ec)
-			BOOST_LOG_TRIVIAL(error) << "Error in write";
+				if(ec)
+					BOOST_LOG_TRIVIAL(error) << "Error in write";
+			}
+		);
+		
+		return (ssize_t)length;
 	}
+
+	boost::asio::async_write(*client_instance->socket_,
+		boost::asio::buffer(data, length),
+		[client_instance](boost::system::error_code ec, std::size_t length)
+		{
+			BOOST_LOG_TRIVIAL(trace) << "Send through send_callback: " << length;
+
+			if(ec)
+				BOOST_LOG_TRIVIAL(error) << "Error in write";
+		}
 	);
 
 	return (ssize_t)length;
@@ -538,52 +634,4 @@ ssize_t on_rtsp_data_source_read_callback(nghttp2_session* session, int32_t stre
 	*data_flags = NGHTTP2_DATA_FLAG_EOF;
 
 	return (ssize_t)myds->dataLen;
-}
-
-int main(int argc, char* argv[])
-{
-	std::cout << "Started..." << std::endl;
-
-	mylog::init();
-
-	try
-	{
-		if(argc != 4)
-		{
-			std::cerr << "Usage: uplink_cloud_service <listen http2 port> <listen http port> <listen rtsp port>\n";
-			return 1;
-		}
-
-		BOOST_LOG_TRIVIAL(info) << "*** New run ***";
-
-		short http2_port = std::atoi(argv[1]);
-		short http_port = std::atoi(argv[2]);
-		short rtsp_port = std::atoi(argv[3]);
-
-		std::cout << "ports: http2=" << http2_port
-			<< "; http_port=" << http_port
-			<< "; rtsp_port=" << rtsp_port << std::endl;
-
-		boost::asio::io_context io_context;
-
-		Client c(io_context, http2_port, http_port, rtsp_port);
-
-		std::thread t([&io_context]()
-		{
-			io_context.run();
-		});
-
-		t.join();
-		c.close();
-
-		BOOST_LOG_TRIVIAL(info) << "*** Service stopped ***\n";
-	}
-	catch(std::exception& e)
-	{
-		BOOST_LOG_TRIVIAL(fatal) << "Finished with an exception: " << e.what() << "\n";
-		std::cerr << "Exception: " << e.what() << std::endl;
-	}
-
-	std::cout << "Finished!" << std::endl;
-	return 0;
 }

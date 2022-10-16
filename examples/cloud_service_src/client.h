@@ -5,6 +5,7 @@
 #include <nghttp2/nghttp2.h>
 
 #include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
 
 #include <memory>
 
@@ -22,11 +23,6 @@
 		NGHTTP2_NV_FLAG_NONE                                                   \
 	}
 
-namespace
-{
-	using boost::asio::ip::tcp;
-}
-
 struct MyDataSource
 {
 	const uint8_t* data;
@@ -36,7 +32,25 @@ struct MyDataSource
 class Client
 {
 public:
-	Client(boost::asio::io_context& io_context, short http2_port, short requests_listening_port, short rtsp_listening_port);
+	struct PlainConnection
+	{
+		unsigned short port;
+	};
+
+	struct SecuredConnection
+	{
+		unsigned short port;
+	};
+
+	explicit Client(boost::asio::io_context& io_context,
+		PlainConnection conn,
+		unsigned short requests_listening_port,
+		unsigned short rtsp_listening_port);
+
+	explicit Client(boost::asio::io_context& io_context,
+		SecuredConnection conn,
+		unsigned short requests_listening_port,
+		unsigned short rtsp_listening_port);
 
 private:
 	void do_accept();
@@ -61,11 +75,14 @@ public:
 
 	//private:
 	boost::asio::io_context& io_context_;
-	tcp::acceptor acceptor_;
-	tcp::acceptor requests_listening_port_acceptor_;
-	tcp::acceptor rtsp_listening_port_acceptor_;
+	std::unique_ptr<boost::asio::ip::tcp::acceptor> plain_connections_acceptor_;
+	std::unique_ptr<boost::asio::ip::tcp::acceptor> secure_connections_acceptor_;
+	boost::asio::ip::tcp::acceptor requests_listening_port_acceptor_;
+	boost::asio::ip::tcp::acceptor rtsp_listening_port_acceptor_;
 
 	std::unique_ptr<boost::asio::ip::tcp::socket> socket_;
+	std::unique_ptr<boost::asio::ssl::context> ssl_context_;
+	std::unique_ptr<boost::asio::ssl::stream<boost::asio::ip::tcp::socket>> ssl_socket_;
 
 	nghttp2_session* http2_session_;
 
