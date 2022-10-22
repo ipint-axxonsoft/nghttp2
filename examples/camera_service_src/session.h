@@ -5,6 +5,7 @@
 #include <nghttp2/nghttp2.h>
 
 #include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
 
 #include <memory>
 #include <vector>
@@ -12,17 +13,12 @@
 
 extern const uint32_t RTSP_STREAM_ID;
 
-namespace
-{
-	using boost::asio::ip::tcp;
-}
-
 class Session;
 
 class RTSPConnection : public std::enable_shared_from_this<RTSPConnection>
 {
 public:
-	RTSPConnection(int32_t streamID, std::shared_ptr<tcp::socket>&& socket, Session* parent);
+	RTSPConnection(int32_t streamID, std::shared_ptr<boost::asio::ip::tcp::socket>&& socket, Session* parent);
 	RTSPConnection(RTSPConnection&&) = default;
 
 	inline int32_t StreamID() const
@@ -47,7 +43,7 @@ private:
 
 private:
 	int32_t stream_id_ = -1;
-	std::shared_ptr<tcp::socket> rtsp_socket_;
+	std::shared_ptr<boost::asio::ip::tcp::socket> rtsp_socket_;
 	Session* parent_ = nullptr;
 	std::unique_ptr<ws::Server> ws_;
 
@@ -62,7 +58,7 @@ private:
 class HTTPConnection : public std::enable_shared_from_this<HTTPConnection>
 {
 public:
-	HTTPConnection(int32_t streamID, tcp::resolver::results_type camera_endpoints, Session* parent);
+	HTTPConnection(int32_t streamID, boost::asio::ip::tcp::resolver::results_type camera_endpoints, Session* parent);
 
 	inline int32_t StreamID() const
 	{
@@ -92,8 +88,8 @@ private:
 	std::string path_;
 	std::string auth_;
 
-	const tcp::resolver::results_type camera_endpoints_;
-	std::unique_ptr<tcp::socket> socket_;
+	const boost::asio::ip::tcp::resolver::results_type camera_endpoints_;
+	std::unique_ptr<boost::asio::ip::tcp::socket> socket_;
 	Session* parent_ = nullptr;
 	std::string local_endpoint_;
 
@@ -109,9 +105,14 @@ class Session
 	: public std::enable_shared_from_this<Session>
 {
 public:
-	Session(tcp::socket socket,
-		const tcp::resolver::results_type& camera_endpoints,
-		const tcp::resolver::results_type& camera_rtsp_endpoint,
+	Session(std::shared_ptr<boost::asio::ip::tcp::socket> socket,
+		const boost::asio::ip::tcp::resolver::results_type& camera_endpoints,
+		const boost::asio::ip::tcp::resolver::results_type& camera_rtsp_endpoint,
+		boost::asio::io_context& io_ctx);
+
+	Session(std::shared_ptr<boost::asio::ssl::stream<boost::asio::ip::tcp::socket>> socket,
+		const boost::asio::ip::tcp::resolver::results_type& camera_endpoints,
+		const boost::asio::ip::tcp::resolver::results_type& camera_rtsp_endpoint,
 		boost::asio::io_context& io_ctx);
 
 	~Session();
@@ -139,20 +140,21 @@ public:
 	void connect_rtsp(int32_t http2_stream_id);
 
 public:
-	tcp::socket socket_;
+	std::shared_ptr<boost::asio::ip::tcp::socket> socket_;
+	std::shared_ptr<boost::asio::ssl::stream<boost::asio::ip::tcp::socket>> ssl_socket_;
 	enum { max_length = 65536 };
 	char data_[max_length];
 
 	nghttp2_session* http2_session_;
 
-	const tcp::resolver::results_type camera_endpoints_;
-	const tcp::resolver::results_type camera_rtsp_endpoint_;
+	const boost::asio::ip::tcp::resolver::results_type camera_endpoints_;
+	const boost::asio::ip::tcp::resolver::results_type camera_rtsp_endpoint_;
 
 	std::string local_endpoint_;
 
 	boost::asio::io_context& io_context_;
 
-	std::shared_ptr<tcp::socket> camera_socket_;
+	std::shared_ptr<boost::asio::ip::tcp::socket> camera_socket_;
 	std::vector<std::shared_ptr<RTSPConnection>> rtsp_conns_;
 
 	std::vector<std::shared_ptr<HTTPConnection>> http_conns_;

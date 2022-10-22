@@ -10,6 +10,8 @@
 
 const uint32_t RTSP_STREAM_ID = 1;
 
+using boost::asio::ip::tcp;
+
 struct MyDataSource
 {
 	const uint8_t* data = nullptr;
@@ -280,7 +282,19 @@ ssize_t send_callback(nghttp2_session* /*session_data*/, const uint8_t* data, si
 {
 	Session* session_instance = (Session*)user_data;
 
-	auto s = session_instance->socket_.write_some(boost::asio::buffer(data, length));
+	if (auto ssl_socket = session_instance->ssl_socket_)
+	{
+		auto s = ssl_socket->write_some(boost::asio::buffer(data, length));
+
+		BOOST_LOG_TRIVIAL(trace) << "nghttp2 writes in size: " << length;
+
+		if(s != length)
+			BOOST_LOG_TRIVIAL(warning) << "nghttp2 wanted to write: " << length << ". Sent bytes: " << s;
+
+		return (ssize_t)s;
+	}
+
+	auto s = session_instance->socket_->write_some(boost::asio::buffer(data, length));
 
 	BOOST_LOG_TRIVIAL(trace) << "nghttp2 writes in size: " << length;
 
@@ -304,17 +318,47 @@ ssize_t send_callback(nghttp2_session* /*session_data*/, const uint8_t* data, si
 
 ssize_t on_rtsp_datasource_read(nghttp2_session* Session, int32_t stream_id, uint8_t* buf, size_t length, uint32_t* data_flags, nghttp2_data_source* source, void* user_data);
 
-Session::Session(tcp::socket socket,
+Session::Session(std::shared_ptr<tcp::socket> socket,
 	const tcp::resolver::results_type& camera_endpoints,
 	const tcp::resolver::results_type& camera_rtsp_endpoint,
 	boost::asio::io_context& io_ctx)
-	: socket_(std::move(socket)),
+	: socket_(socket),
 		camera_endpoints_(camera_endpoints),
 		camera_rtsp_endpoint_(camera_rtsp_endpoint),
 		io_context_(io_ctx)
 {
-	BOOST_LOG_TRIVIAL(debug) << "New connection: " << socket_.remote_endpoint().address().to_string() << ":" << socket_.remote_endpoint().port();
+	BOOST_LOG_TRIVIAL(debug) << "New connection: " << socket_->remote_endpoint().address().to_string() << ":" << socket_->remote_endpoint().port();
 
+
+	nghttp2_session_callbacks* mycallbacks;
+	nghttp2_session_callbacks_new(&mycallbacks);
+
+	nghttp2_session_callbacks_set_send_callback(mycallbacks, send_callback);
+
+
+	nghttp2_session_callbacks_set_on_frame_recv_callback(mycallbacks, on_frame_recv_callback);
+	nghttp2_session_callbacks_set_on_header_callback(mycallbacks, on_header_callback);
+	nghttp2_session_callbacks_set_on_stream_close_callback(mycallbacks, on_stream_close_callback);
+
+	nghttp2_session_callbacks_set_on_data_chunk_recv_callback(mycallbacks, on_data_chunk_recv_callback);
+
+	nghttp2_session_server_new(&http2_session_, mycallbacks, this);
+
+	nghttp2_session_callbacks_del(mycallbacks);
+}
+
+Session::Session(std::shared_ptr<boost::asio::ssl::stream<boost::asio::ip::tcp::socket>> socket,
+	const boost::asio::ip::tcp::resolver::results_type& camera_endpoints,
+	const boost::asio::ip::tcp::resolver::results_type& camera_rtsp_endpoint,
+	boost::asio::io_context& io_ctx)
+	: ssl_socket_(socket),
+		camera_endpoints_(camera_endpoints),
+		camera_rtsp_endpoint_(camera_rtsp_endpoint),
+		io_context_(io_ctx)
+{
+	BOOST_LOG_TRIVIAL(debug) << "New SSL connection: "
+		<< ssl_socket_->lowest_layer().remote_endpoint().address().to_string()
+		<< ":" << ssl_socket_->lowest_layer().remote_endpoint().port();
 
 	nghttp2_session_callbacks* mycallbacks;
 	nghttp2_session_callbacks_new(&mycallbacks);
@@ -437,13 +481,16 @@ int Session::forward_response(int32_t stream_id, short status_code, const uint8_
 
 int Session::session_send()
 {
-	int rv;
-	rv = nghttp2_session_send(http2_session_);
-
-	if(rv != 0)
+	if (nghttp2_session_want_write(http2_session_))
 	{
-		BOOST_LOG_TRIVIAL(error) << "Session send finished with an error: " << nghttp2_strerror(rv);
-		return -1;
+		int rv;
+		rv = nghttp2_session_send(http2_session_);
+
+		if(rv != 0)
+		{
+			BOOST_LOG_TRIVIAL(error) << "Session send finished with an error: " << nghttp2_strerror(rv);
+			return -1;
+		}
 	}
 
 	return 0;
@@ -467,7 +514,46 @@ void Session::Start()
 void Session::do_read()
 {
 	auto self(shared_from_this());
-	socket_.async_read_some(boost::asio::buffer(data_, max_length),
+	if (ssl_socket_)
+	{
+		ssl_socket_->async_read_some(boost::asio::buffer(data_, max_length),
+			[this, self](boost::system::error_code ec, std::size_t length)
+			{
+
+				if(ec == boost::asio::error::eof)
+				{
+					BOOST_LOG_TRIVIAL(info) << "HTTP/2 client closed the connection";
+					return;
+				}
+				else if(!ec)
+				{
+					BOOST_LOG_TRIVIAL(trace) << "reading on HTTP2 connection. len: " << length;
+
+					ssize_t readlen;
+					readlen = nghttp2_session_mem_recv(http2_session_, (const uint8_t*)data_, length);
+
+					if(readlen < 0)
+					{
+						throw std::runtime_error(std::string("Fatal error: ") + nghttp2_strerror((int)readlen));
+					}
+
+					if(session_send() != 0)
+					{
+						throw std::runtime_error("Error in session_send");
+					}
+				}
+				else
+				{
+					BOOST_LOG_TRIVIAL(error) << "Error in reading: " << ec.message();
+				}
+
+				do_read();
+			});
+
+		return;
+	}
+
+	socket_->async_read_some(boost::asio::buffer(data_, max_length),
 		[this, self](boost::system::error_code ec, std::size_t length)
 	{
 
@@ -478,6 +564,8 @@ void Session::do_read()
 		}
 		else if(!ec)
 		{
+			BOOST_LOG_TRIVIAL(trace) << "reading on HTTP2 connection. len: " << length;
+
 			ssize_t readlen;
 			readlen = nghttp2_session_mem_recv(http2_session_, (const uint8_t*)data_, length);
 
@@ -608,14 +696,32 @@ void Session::do_read_on_camera_socket(int32_t stream_id)
 void Session::do_write(std::size_t length)
 {
 	auto self(shared_from_this());
-	boost::asio::async_write(socket_, boost::asio::buffer(data_, length),
-		[this, self](boost::system::error_code ec, std::size_t /*length*/)
+
+	if (ssl_socket_)
 	{
-		if(!ec)
+		boost::asio::async_write(*ssl_socket_, boost::asio::buffer(data_, length),
+			[this, self](boost::system::error_code ec, std::size_t /*length*/)
+			{
+				if(ec)
+				{
+					BOOST_LOG_TRIVIAL(error) << "Failed to write in SSL socket: " << ec.message();
+					return;
+				}
+			});
+
+		return;
+	}
+
+
+	boost::asio::async_write(*socket_, boost::asio::buffer(data_, length),
+		[this, self](boost::system::error_code ec, std::size_t /*length*/)
 		{
-			//do_read();
-		}
-	});
+			if(ec)
+			{
+				BOOST_LOG_TRIVIAL(error) << "Failed to write in socket: " << ec.message();
+				return;
+			}
+		});
 }
 
 RTSPConnection::RTSPConnection(int32_t streamID, std::shared_ptr<tcp::socket>&& socket, Session* parent)
@@ -774,7 +880,7 @@ void RTSPConnection::wsIncomingDataReadyCb(const char* data, size_t dataLen)
 	{
 		if(ec)
 		{
-			BOOST_LOG_TRIVIAL(error) << "Error in write";
+			BOOST_LOG_TRIVIAL(error) << "Error in write: " << ec.message();
 			return;
 		}
 

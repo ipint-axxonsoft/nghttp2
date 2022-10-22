@@ -86,6 +86,7 @@ if(ENABLE_EXAMPLES)
      camera_service_src/session.h
      camera_service_src/log.h
      camera_service_src/log.cc
+     camera_service_src/main.cpp
      )
 
     target_include_directories(uplink_camera_service PRIVATE

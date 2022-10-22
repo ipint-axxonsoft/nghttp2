@@ -6,6 +6,7 @@
 
 #include <boost/system/error_code.hpp>
 #include <boost/asio.hpp>
+#include <boost/asio/ssl/context.hpp>
 #include <boost/beast/http.hpp>
 
 #include <iostream>
@@ -21,18 +22,20 @@
 		NGHTTP2_NV_FLAG_NONE                                                   \
 }
 
-namespace
-{
-	using boost::asio::ip::tcp;
-}
-
 class Server
 {
 public:
+	enum class CONNECTION_TYPE
+	{
+		SECURED,
+		PLAIN
+	};
+
 	Server(boost::asio::io_context& io_context,
-		const tcp::resolver::results_type& endpoint,
-		const tcp::resolver::results_type& camera_endpoint,
-		const tcp::resolver::results_type& rtsp_endpoints);
+		const boost::asio::ip::tcp::resolver::results_type& endpoint,
+		CONNECTION_TYPE conn_type,
+		const boost::asio::ip::tcp::resolver::results_type& camera_endpoint,
+		const boost::asio::ip::tcp::resolver::results_type& rtsp_endpoints);
 
 	void Start()
 	{
@@ -40,13 +43,13 @@ public:
 	}
 
 private:
-	void do_connect(const tcp::resolver::results_type& endpoints);
+	void do_connect(const boost::asio::ip::tcp::resolver::results_type& endpoints);
 
 private:
+	CONNECTION_TYPE conn_type_;
 	boost::asio::io_context& io_context_;
-	tcp::socket socket_;
+	boost::asio::ssl::context ssl_ctx_;
 
-	tcp::resolver::results_type camera_endpoints_;
-	tcp::resolver::results_type camera_rtsp_endpoint_;
+	boost::asio::ip::tcp::resolver::results_type camera_endpoints_;
+	boost::asio::ip::tcp::resolver::results_type camera_rtsp_endpoint_;
 };
-
