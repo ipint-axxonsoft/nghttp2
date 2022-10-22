@@ -44,6 +44,14 @@ Client::Client(boost::asio::io_context& io_context,
 	BOOST_LOG_TRIVIAL(info) << "ports: secured http2=" << conn.port
 		<< "; http=" << requests_listening_port
 		<< "; rtsp=" << rtsp_listening_port;
+
+	ssl_context_->set_options(boost::asio::ssl::context::default_workarounds
+        | boost::asio::ssl::context::no_sslv2
+        | boost::asio::ssl::context::single_dh_use);
+	ssl_context_->use_certificate_chain_file("server.pem");
+    ssl_context_->use_private_key_file("key.pem", boost::asio::ssl::context::pem);
+
+	do_accept();
 }
 
 void Client::do_accept()
@@ -65,13 +73,23 @@ void Client::do_accept()
 				ssl_socket_.reset(new boost::asio::ssl::stream<tcp::socket>(
 					std::move(socket), *ssl_context_));
 
-				init_nghttp2();
-				open_http2_connection();
+				ssl_socket_->async_handshake(boost::asio::ssl::stream_base::server,
+					[this](const boost::system::error_code& error)
+					{
+						if (error)
+						{
+							BOOST_LOG_TRIVIAL(error) << "HTTP/2 SSL handshake failed: " << error.message();
+							return;
+						}
 
-				do_read();
+						init_nghttp2();
+						open_http2_connection();
 
-				do_requests_port_accept();
-				do_rtsp_connections_accept();
+						do_read();
+
+						do_requests_port_accept();
+						do_rtsp_connections_accept();
+					});
 			}
 		);
 	}
@@ -235,7 +253,7 @@ void Client::do_read()
 			{
 				if(ec)
 				{
-					BOOST_LOG_TRIVIAL(error) << "Reading finished with an error";
+					BOOST_LOG_TRIVIAL(error) << "Reading finished with an error: " << ec.message();
 					return;
 				}
 
@@ -261,7 +279,7 @@ void Client::do_read()
 		{
 			if(ec)
 			{
-				BOOST_LOG_TRIVIAL(error) << "Reading finished with an error";
+				BOOST_LOG_TRIVIAL(error) << "Reading finished with an error: " << ec.message();
 				return;
 			}
 
@@ -435,20 +453,22 @@ ssize_t send_callback(nghttp2_session* session, const uint8_t* data,
 	auto* client_instance = (Client*) user_data;
 	if (client_instance->ssl_socket_)
 	{
-		boost::asio::async_write(*client_instance->ssl_socket_,
-			boost::asio::buffer(data, length),
-			[client_instance](boost::system::error_code ec, std::size_t length)
-			{
-				BOOST_LOG_TRIVIAL(trace) << "Send through send_callback: " << length;
+		BOOST_LOG_TRIVIAL(trace) << "Send through send_callback: " << length;
+		boost::system::error_code ec;
+		auto write_size = boost::asio::write(*client_instance->ssl_socket_, boost::asio::buffer(data, length), ec);
+		if (ec)
+		{
+			BOOST_LOG_TRIVIAL(error) << "Error in write" << ec.message();
+		}
 
-				if(ec)
-					BOOST_LOG_TRIVIAL(error) << "Error in write";
-			}
-		);
-		
-		return (ssize_t)length;
+		if (write_size != length)
+			BOOST_LOG_TRIVIAL(warning)
+				<< boost::format("Wrote data size (%1%) note match need to (%2%)") % write_size % length;
+
+		return (ssize_t)write_size;
 	}
 
+	// TODO: I think this send also should be blocking as for secure version one above
 	boost::asio::async_write(*client_instance->socket_,
 		boost::asio::buffer(data, length),
 		[client_instance](boost::system::error_code ec, std::size_t length)

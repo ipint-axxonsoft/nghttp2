@@ -25,6 +25,7 @@ void conflicting_options(const po::variables_map& vm,
 
 int main(int argc, char* argv[])
 {
+	std::cout << "Starting" << std::endl;
 
 	mylog::init();
 
@@ -81,10 +82,6 @@ int main(int argc, char* argv[])
 		c->close();
 
 		BOOST_LOG_TRIVIAL(info) << "*** Service stopped ***\n";
-	}
-	catch (const po::error &e)
-	{
-		std::cerr << e.what() << '\n';
 	}
 	catch(const std::exception& e)
 	{
